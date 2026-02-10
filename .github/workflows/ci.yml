@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+    runs-on: ${{ matrix.os }}
+    name: test (${{ matrix.os }}, ${{ matrix.compiler }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCHM_BUILD_BENCHMARKS=OFF
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    strategy:
+      matrix:
+        sanitizer: [asan, tsan]
+    runs-on: ubuntu-latest
+    name: ${{ matrix.sanitizer }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCHM_SANITIZER=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Run benchmarks
+        run: |
+          for b in bench_read_heavy bench_write_heavy bench_mixed bench_contention bench_scaling; do
+            echo "=== $b ==="
+            ./build/benchmark/$b --benchmark_format=console
+          done
+      - name: Export benchmark results
+        run: |
+          mkdir -p benchmark-results
+          for b in bench_read_heavy bench_write_heavy bench_mixed bench_contention bench_scaling; do
+            ./build/benchmark/$b --benchmark_format=json > benchmark-results/$b.json
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results/
