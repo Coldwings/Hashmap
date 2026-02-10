@@ -72,7 +72,10 @@ private:
         unsigned                  ops_since_advance{0}; // thread-local only
         std::atomic<bool>         alive{true};
         std::atomic<ThreadEntry*> next{nullptr};
-        EpochManager*             owner{nullptr};
+        std::atomic<EpochManager*> owner{nullptr};
+        // Reference count: one for the EpochManager (thread_list_),
+        // one for the ThreadHandle.  The last to release deletes.
+        std::atomic<int>          ref_count{2};
     };
 
     // ------------------------------------------------------------------
@@ -86,6 +89,9 @@ private:
             if (entry) {
                 entry->active.store(false, std::memory_order_release);
                 entry->alive.store(false, std::memory_order_release);
+                if (entry->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    delete entry;
+                }
                 entry = nullptr;
             }
         }
@@ -108,11 +114,16 @@ public:
         for (int i = 0; i < 3; ++i) {
             retire_lists_[i].drain();
         }
-        // Free every ThreadEntry in the intrusive list.
+        // Release the manager's reference to each ThreadEntry.
+        // The ThreadHandle destructor holds the other reference;
+        // the last one to release deletes the entry.
         ThreadEntry* e = thread_list_.load(std::memory_order_relaxed);
         while (e) {
             ThreadEntry* nxt = e->next.load(std::memory_order_relaxed);
-            delete e;
+            e->owner.store(nullptr, std::memory_order_release);
+            if (e->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                delete e;
+            }
             e = nxt;
         }
     }
@@ -179,10 +190,13 @@ public:
         }
 
         // If the handle currently points to a different manager's entry,
-        // mark that entry as dead before switching.
+        // mark that entry as dead and release the handle's reference.
         if (entry) {
             entry->active.store(false, std::memory_order_release);
             entry->alive.store(false, std::memory_order_release);
+            if (entry->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                delete entry;
+            }
         }
 
         // Allocate a new entry for this (manager, thread) pair.

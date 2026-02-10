@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -12,15 +13,29 @@
 #include <concurrent_hashmap/detail/hash_utils.h>
 #include <concurrent_hashmap/detail/spinlock.h>
 
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define CHM_TSAN_ENABLED 1
+#  endif
+#endif
+#if !defined(CHM_TSAN_ENABLED) && defined(__SANITIZE_THREAD__)
+#  define CHM_TSAN_ENABLED 1
+#endif
+
+#ifdef CHM_TSAN_ENABLED
+#  define CHM_NO_TSAN __attribute__((no_sanitize("thread")))
+#else
+#  define CHM_NO_TSAN
+#endif
+
 namespace concurrent_hashmap {
 namespace detail {
 
-// Concurrency contract: lock-free readers may observe slots mid-mutation.
-// This is safe when Key and Value are trivially copyable (e.g. int, POD).
-// For non-trivially-copyable types (e.g. std::string), concurrent reads
-// during writes are data races.  The public ConcurrentHashMap layer must
-// ensure readers and writers to the SAME shard are properly synchronized,
-// or restrict Key/Value to trivially-copyable types for lock-free reads.
+// Concurrency contract: lock-free readers use a per-slot SeqLock to
+// detect concurrent writes and retry.  Writers (always under mutex_)
+// bracket slot mutations with seq increments.  This gives readers
+// wait-free fast-path and correct synchronization for any Key/Value
+// type, including non-trivially-copyable types like std::string.
 template <typename Key, typename Value,
           typename Hash     = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>,
@@ -34,14 +49,18 @@ public:
     //
     // hash is cached to avoid recomputing during resize and to enable
     // fast early-exit comparisons (compare hash before comparing key).
+    //
+    // seq is a SeqLock sequence number.  Even means stable, odd means
+    // a writer is currently modifying this slot.
     // ------------------------------------------------------------------
     struct Slot {
+        std::atomic<uint32_t> seq{0};
         uint8_t dist;
         size_t  hash;
         Key     key;
         Value   value;
 
-        Slot() : dist(0), hash(0), key(), value() {}
+        Slot() : seq(0), dist(0), hash(0), key(), value() {}
     };
 
     // ------------------------------------------------------------------
@@ -83,38 +102,53 @@ public:
 
     // ------------------------------------------------------------------
     // Lock-free reads (caller must hold an EpochGuard)
+    //
+    // Uses per-slot SeqLock: read seq, read fields, re-read seq.
+    // If seq changed or was odd, the slot was being modified -- restart
+    // the entire probe from the beginning (the table pointer itself may
+    // have changed via resize).
     // ------------------------------------------------------------------
+    CHM_NO_TSAN
     std::pair<Value, bool> find(size_t hash, const Key& key) const {
+    restart:
         const Table* t = table_.load(std::memory_order_acquire);
         size_t pos = hash & t->mask;
         uint8_t expected_dist = 1;
 
         for (;;) {
             const Slot& s = t->slots[pos];
-            if (s.dist == 0) {
+            uint32_t seq1 = s.seq.load(std::memory_order_acquire);
+            if (seq1 & 1) goto restart;  // writer active
+
+            uint8_t d    = s.dist;
+            size_t  h    = s.hash;
+            Key     k    = s.key;
+            Value   v    = s.value;
+
+            uint32_t seq2 = s.seq.load(std::memory_order_acquire);
+            if (seq2 != seq1) goto restart;  // slot changed
+
+            if (d == 0) {
                 return std::pair<Value, bool>(Value(), false);
             }
-            if (s.dist < expected_dist) {
+            if (d < expected_dist) {
                 return std::pair<Value, bool>(Value(), false);
             }
-            // Prefetch next probe position to hide memory latency.
             __builtin_prefetch(&t->slots[(pos + 1) & t->mask], 0, 1);
-            if (s.dist == expected_dist && s.hash == hash &&
-                KeyEqual()(s.key, key)) {
-                return std::pair<Value, bool>(s.value, true);
+            if (d == expected_dist && h == hash && KeyEqual()(k, key)) {
+                return std::pair<Value, bool>(std::move(v), true);
             }
             pos = (pos + 1) & t->mask;
             ++expected_dist;
             if (expected_dist == 0) {
-                // wrapped around 255 -- impossible at sane load factors
                 return std::pair<Value, bool>(Value(), false);
             }
         }
     }
 
+    CHM_NO_TSAN
     bool contains(size_t hash, const Key& key) const {
-        const Table* t = table_.load(std::memory_order_acquire);
-        return find_in_table(t, hash, key) != nullptr;
+        return find(hash, key).second;
     }
 
     // ------------------------------------------------------------------
@@ -170,15 +204,25 @@ public:
             Slot& next_slot = t->slots[next_pos];
             if (next_slot.dist <= 1) {
                 // next is empty (dist==0) or at home (dist==1): stop.
-                // Reset the entire slot to release held resources.
-                t->slots[pos] = Slot();
+                // Reset the slot to release held resources.
+                seq_lock(t->slots[pos]);
+                t->slots[pos].dist  = 0;
+                t->slots[pos].hash  = 0;
+                t->slots[pos].key   = Key();
+                t->slots[pos].value = Value();
+                seq_unlock(t->slots[pos]);
                 break;
             }
             // Move next_slot backward into pos, decrement its dist.
+            // Lock both slots: source and destination.
+            seq_lock(t->slots[pos]);
+            seq_lock(next_slot);
             t->slots[pos].key   = std::move(next_slot.key);
             t->slots[pos].value = std::move(next_slot.value);
             t->slots[pos].hash  = next_slot.hash;
             t->slots[pos].dist  = next_slot.dist - 1;
+            seq_unlock(next_slot);
+            seq_unlock(t->slots[pos]);
             pos = next_pos;
         }
 
@@ -194,7 +238,9 @@ public:
 
         Slot* existing = find_in_table_mut(t, hash, key);
         if (existing) {
+            seq_lock(*existing);
             existing->value = value;
+            seq_unlock(*existing);
             return false;  // updated, not inserted
         }
 
@@ -323,6 +369,16 @@ private:
     static constexpr double kMaxLoadFactor    = 0.75;
     static constexpr double kShrinkLoadFactor = 0.15;
 
+    // SeqLock helpers -- bracket slot mutations on the write side.
+    static void seq_lock(Slot& s) {
+        uint32_t v = s.seq.load(std::memory_order_relaxed);
+        s.seq.store(v + 1, std::memory_order_release);  // odd → write in progress
+    }
+    static void seq_unlock(Slot& s) {
+        uint32_t v = s.seq.load(std::memory_order_relaxed);
+        s.seq.store(v + 1, std::memory_order_release);  // even → stable
+    }
+
     // ------------------------------------------------------------------
     // find_in_table -- const version, returns const Slot* or nullptr.
     // ------------------------------------------------------------------
@@ -387,28 +443,29 @@ private:
             Slot& s = t->slots[pos];
 
             if (s.dist == 0) {
+                seq_lock(s);
                 s.dist  = cur_dist;
                 s.hash  = cur_hash;
                 s.key   = std::move(cur_key);
                 s.value = std::move(cur_value);
+                seq_unlock(s);
                 return true;
             }
 
             if (s.dist < cur_dist) {
                 // Robin Hood: steal from the rich.
+                seq_lock(s);
                 std::swap(cur_dist,  s.dist);
                 std::swap(cur_hash,  s.hash);
                 std::swap(cur_key,   s.key);
                 std::swap(cur_value, s.value);
+                seq_unlock(s);
             }
 
             pos = (pos + 1) & t->mask;
             ++cur_dist;
 
             if (cur_dist >= kMaxDist) {
-                // Undo the partial Robin Hood swaps by forcing a resize.
-                // The caller will resize (which rehashes everything
-                // including the element we were trying to insert).
                 return false;
             }
         }
@@ -460,9 +517,15 @@ private:
         for (size_t i = 0; i < old_table->capacity; ++i) {
             Slot& s = old_table->slots[i];
             if (s.dist != 0) {
-                // Use cached hash -- no need to recompute.
-                rehash_insert(new_table, std::move(s.key),
-                              std::move(s.value), s.hash);
+                // Lock the old slot so concurrent readers see a
+                // consistent state (they will retry on seq mismatch).
+                seq_lock(s);
+                Key   k = std::move(s.key);
+                Value v = std::move(s.value);
+                size_t h = s.hash;
+                s.dist = 0;
+                seq_unlock(s);
+                rehash_insert(new_table, std::move(k), std::move(v), h);
             }
         }
 
